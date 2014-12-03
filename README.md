@@ -92,7 +92,9 @@ Get some help
 	  --rism1d RISM1D       Type of 1D-RISM theory. Only DRISM has been
 		                extensively tested [DRISM]
 
-
+Notes
+-----
+The script has been tested only on Ubuntu, but it should work on most Linux distributions and on Mac OS X. To make it Windows-friendly one would probably need to change the names of executable programs and add them to PATH.
 
 
 
