@@ -7,7 +7,7 @@ Created on Thu Jan 30 16:04:49 2014
 
 Compute hydration free energie with rism3d.singlpnt using GAFF force field
 and AM1-BCC charges. The script prepares topology, runs 1D-RISM and 
-3D-RISM calculation and computes free energies using PMVc and ISc corrections.
+3D-RISM calculation and computes free energies using ISc and ISc* corrections.
 The output is written to separate resutls.txt file.
 
 As an input takes pdb file compatible with antechamber. For example:
@@ -110,7 +110,7 @@ dGhyd(GF)= {gf} kcal/mol
 PMV= {pmv} AA^3
 
 dGhyd(ISc)= {isc} kcal/mol
-dGhyd(PMVc)= {pmvc} kcal/mol
+dGhyd(ISc*)= {isc_star} kcal/mol
 
 """
 
@@ -183,9 +183,8 @@ def process_command_line(argv):
                         default="SPC")
     parser.add_argument('--closure',
                         help="""Brdige closure which will be used in both
-                        1D-RISM and 3D-RISM simmulations. Note that ISc and
-                        PMVc corrections that are printed out in results
-                        file are meaningless with non-HNC closures [HNC]""",
+                        1D-RISM and 3D-RISM simmulations. Either HNC, PSEn or
+                        KH (n in PSEn should be an integer). [HNC]""",
                         default="HNC")
     parser.add_argument('--rism1d',
                         help="""Type of 1D-RISM theory. Only DRISM has been
@@ -564,6 +563,9 @@ def prepare_3drism_calc(name, T=298.15, wmodel="SPC", rism1d="DRISM",
     with open(water_therm_p, 'rb') as f:
         w_lines = f.readlines()
     compres = float(w_lines[2].split()[-1])
+    units = w_lines[2].split()[-2]
+    if units == '[1/kPa]':  # # !! In ambertools 14 compressiblity has [1/kpa] units!
+        compres = compres*1.0e4
     prmtop_name = '{}.prmtop'.format(no_p_name)
     return logfile, prmtop_name, compres
 
@@ -672,9 +674,9 @@ def write_results(name, T, compres):
     cor = 1.9872041E-3*T/2*rho_c_k0*density*pmv
     fix_cor = -density*1.9872041E-3*T*pmv
     isc = hnc + cor + fix_cor # initial state correction [kcal/mol]
-    pmvc = hnc + cor # partial molar volume correction [kcal/mol]
+    isc_star = hnc + cor # partial molar volume correction [kcal/mol]
 
-    results = RESULTS.format(hnc=hnc, gf=gf, pmv=pmv, isc=isc, pmvc=pmvc)
+    results = RESULTS.format(hnc=hnc, gf=gf, pmv=pmv, isc=isc, isc_star=isc_star)
     #Write results
     with open(os.path.join(p, RESULTS_NAME), 'wb') as f:
         f.write(results)
