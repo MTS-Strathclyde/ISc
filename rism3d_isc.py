@@ -6,7 +6,7 @@ Created on Thu Jan 30 16:04:49 2014
 @author: Maksim Misin (mishin1991@gmail.com)
 
 Compute hydration free energie with rism3d.singlpnt using GAFF force field
-and AM1-BCC charges. The script prepares topology, runs 1D-RISM and 
+and AM1-BCC charges. The script prepares topology, runs 1D-RISM and
 3D-RISM calculation and computes free energies using ISc and ISc* corrections.
 The output is written to separate resutls.txt file.
 
@@ -62,7 +62,7 @@ import signal
 
 
 ## Non RISM globals ##
-__version__ = '2014.1'
+__version__ = '2015.2'
 
 REQUIRED_EXECUTABLES = ['antechamber', 'parmchk', 'tleap', 'rism3d.snglpnt',
                         'rism1d']
@@ -73,24 +73,24 @@ IS_UNIX = os.name == 'posix'
 
 SOLV_SUCEPT_SCRPT = """#!/bin/csh -f
 
-cat > water_{temp}.inp <<EOF
+cat > {name1d}.inp <<EOF
 &PARAMETERS
-	THEORY='{rism1d}', CLOSUR='{closure}',           !Theory
-	NR=16384, DR=0.025,                    !Grid
-	OUTLST='xCGT', routup=384, toutup=0,   !Output
-	NIS=20, DELVV=0.3, TOLVV=1.e-12,       !MDIIS
-	KSAVE=-1, KSHOW=1, maxstep=10000,      !Check pointing and iterations
-	SMEAR=1, ADBCOR=0.5,                   !Electrostatics
-	TEMPER={temp}, DIEps={diel},           !bulk solvent properties
-	NSP=1
+    THEORY='{rism1d}', CLOSUR='{closure}',           !Theory
+    NR=16384, DR=0.025,                    !Grid
+    OUTLST='xCGT', routup=384, toutup=0,   !Output
+    NIS=20, DELVV=0.3, TOLVV=1.e-12,       !MDIIS
+    KSAVE=-1, KSHOW=1, maxstep=10000,      !Check pointing and iterations
+    SMEAR=1, ADBCOR=0.5,                   !Electrostatics
+    TEMPER={temp}, DIEps={diel},           !bulk solvent properties
+    NSP=1
 /
-	&SPECIES                               !SPC water
-	DENSITY={conc}d0,
-	MODEL="$AMBERHOME/dat/rism1d/model/{wmodel}.mdl"
+    &SPECIES                               !SPC water
+    DENSITY={conc}d0,
+    MODEL="$AMBERHOME/dat/rism1d/model/{smodel}.mdl"
 /
 EOF
 
-rism1d water_{temp} > water_{temp}.out || goto error
+rism1d {name1d} > {name1d}.out || goto error
 
 """
 
@@ -103,9 +103,10 @@ SavePdb MOL {name}.pdb
 quit
 """
 
+RISM1D_NAME = '{smodel}_{temp}'
 RESULTS_NAME = 'results.txt'
 
-RESULTS = """dGhyd(HNC)= {hnc} kcal/mol
+RESULTS = """dGhyd(closure)= {exchem} kcal/mol
 dGhyd(GF)= {gf} kcal/mol
 PMV= {pmv} AA^3
 
@@ -137,6 +138,12 @@ def process_command_line(argv):
                         acceptable by Antechamber. Must have pdb
                         extension.""")
     #Optional args
+    parser.add_argument('-c', '--molcharge',
+                        help="""Charge of the solute [0]""", default=0,
+                        type=int)
+    parser.add_argument('--multiplicity',
+                        help="""Multiplicity of the solute [1]""", default=1,
+                        type=int)
     parser.add_argument('-t', '--temperature',
                         help="""Temperature in K at which simulation will be
                         run [298.15]""", default=298.15, type=float)
@@ -151,45 +158,100 @@ def process_command_line(argv):
                         will be killed. Use 0 for no timeout. [30]. Only works
                         on Unix-like system.
                         """, default=30, type=float)
-    parser.add_argument('--write_h',
-                        help="""Write total correlation function produced
+    parser.add_argument('--write_g',
+                        help="""Write radial distribution functions produced
                         in 3D-RISM calculation""",
                         action='store_true')
     parser.add_argument('--write_c',
                         help="""Write direct correlation function produced
                         in 3D-RISM calculation""",
                         action='store_true')
-    parser.add_argument('--buffer_distance',
+    parser.add_argument('--write_u',
+                        help="""Write solute solvent potential energy grid""",
+                        action='store_true')
+    parser.add_argument('--write_asymp',
+                        help="""Write asymptotics of total and direct 
+                        correlation fuctions in real space.""",
+                        action='store_true')
+    parser.add_argument('--noasympcorr',
+                        help=""" Thermodynamics of 3D-RISM is calculated without
+                        long-range asymptotics.""",
+                        action='store_true')
+    parser.add_argument('--buffer',
                         help="""Minimum distance between the solute and the
                         edge of the solvent box in A for 3D-RISM
-                        calculation [30]""",
-                        default=30, type=float)
-    parser.add_argument('--tollerance',
+                        calculation [25]""",
+                        default=25, type=float)
+    parser.add_argument('--solvbox',
+                        help="""Size of the x, y, and z dimensions of the box in
+                        Angstroms. Specifying this parameter overrides buffer.""",
+                        nargs=3)
+    parser.add_argument('--tolerance',
                         help=""" Maximum residual values for 3D-RISM solution
-                        convergenc. [1E-10]""",
-                        default=1e-10, type=float)
+                        convergence. If many closures a list of closures
+                        can be supplied. [1E-5]""",
+                        default=['1e-5'], nargs='*')
     parser.add_argument('--grdsp',
                         help="""Linear grid spacings for x, y and z
-                        dimensions. Should be separated with spaces
-                        [0.3 0.3 0.3]""",
-                        default=(.3, .3, .3), nargs=3)
+                        dimensions. Should be separated with spaces. Units: A.
+                        [0.5 0.5 0.5]""",
+                        default=(.5, .5, .5), nargs=3)
     parser.add_argument('--polar_decomp',
                         help="""Decomposes solvation free energy into polar
                         and non-polar components""",
                         action='store_true')
-    parser.add_argument('--wmodel',
-                        help="""Water model available in
-                        $AMBERHOME/dat/rism1d/model/{wmodel}.mdl [SPC]""",
+    parser.add_argument('--charge_f',
+                        help="""Supply a charge file to the antechamber. A
+                        file should contain a list of atomic partial charges
+                        appearing in the same ordear as are atoms in tge pdb
+                        file. One row shouldn't contain more than 8 charges.
+                        """)
+    parser.add_argument('--smodel',
+                        help="""Solvent model available in
+                        $AMBERHOME/dat/rism1d/model/{smodel}.mdl [SPC]""",
                         default="SPC")
     parser.add_argument('--closure',
                         help="""Brdige closure which will be used in both
                         1D-RISM and 3D-RISM simmulations. Either HNC, PSEn or
-                        KH (n in PSEn should be an integer). [HNC]""",
-                        default="HNC")
+                        KH (n in PSEn should be an integer) or a list of them
+                        for sequential convergence. If solvent rism1d
+                        is necessary, only last closure will be used for it.
+                        [HNC]""",
+                        default=["HNC"], nargs='*')
+    parser.add_argument('--verbose3d',
+                        help="""Verbosity of 3D-RISM calculation. 0 - print
+                        nothing; 1 - print iterations; 2 - print all. [2]""",
+                        default=2, type=int)
+    parser.add_argument('--maxstep3d',
+                        help="""Maximum number of iterations in 3D-RISM
+                        calculation [500] .""",
+                        default=500, type=int)
     parser.add_argument('--rism1d',
                         help="""Type of 1D-RISM theory. Only DRISM has been
                         extensively tested [DRISM]""",
                         default="DRISM")
+    parser.add_argument('--xvv',
+                        help="""Submit existing xvv file. The 1D-RISM
+                        calculation will not be run and all related parameters
+                        will be ignored. The output therm file of 1D-RISM
+                        calculations must be submited along the xvv file.
+                        Solvent density will be taken from it. Otherwise,
+                        water solvent density will be used for Isc calculation.""")
+    parser.add_argument('--therm',
+                        help="""Output of a 1D-RISM calculation. Note that
+                        the temperature option will be ignored.""")
+    parser.add_argument('-p', '--prmtop',
+                        help="""Submit existing prmtop file.""")
+    parser.add_argument('--dir_name',
+                        help="""Custom name for produced calculation
+                        directory. The default one is:
+                        {mol_name}_{temperature}.""")
+    parser.add_argument('--scale_chg',
+                        help="""Scale all charges predicted by the
+                        antechamber by a certain value. Only applicable if
+                        you don't provide your own prmtop file through
+                        --prmtop. [1.0]""",
+                        default=1.0, type=float)
     return parser.parse_args(argv)
 
 
@@ -284,11 +346,62 @@ def water_concentration(T):
     return 1/(v0*1000)    # mol/L
 
 
+def get_density_from_xvv(xvv_file):
+    """ Return solvent density.
+
+    Parameters
+    ----------
+    xvv_file : string
+        path to xvv file
+
+    Returns
+    -------
+    solvent density : float
+    """
+    with open(xvv_file) as f:
+        for l in f:
+            if l.startswith('%FLAG MTV'):
+                next(f)  # skip format string
+                mult_of_site_1 = int(f.next().split()[0])
+            if l.startswith('%FLAG RHOV'):
+                next(f)  # skip format string
+                density_of_site_1 = float(f.next().split()[0])
+                break
+    return density_of_site_1/mult_of_site_1
+
+
+def get_compressibility_from_therm(therm_p):
+    """ Return solvent compressibility.
+
+    Parameters
+    ----------
+    therm_p : string
+        path to .therm file
+
+    Returns
+    -------
+    compres : float
+        Units: 10e-4/MPa
+    """
+    with open(therm_p, 'r') as f:
+        therm_lines = f.readlines()
+    compres = float(therm_lines[2].split()[-1])
+    units = therm_lines[2].split()[-2]
+    # # !! In ambertools 14 compressiblity is bugged.
+    # Units are shown to be [1/kpa], while in reality compres is 1.0e4 smaller
+    # http://archive.ambermd.org/201503/0651.html
+    if units == '[1/kPa]':
+        compres = compres*1.0e4
+    return compres
+
+
+
 class RunCmd(threading.Thread):
     """ Will only work on Unix-like systems. And sometimes it will not work
-    even on there. """
-    def __init__(self, cmd, timeout, cwd='.'):
-        """ Run subprocess for a fixed ammount of time and then kill it.
+    even there. """
+    def __init__(self, cmd, timeout, logfile, cwd='.'):
+        """ Run subprocess for a fixed ammount of time and then kill it. Writes
+        both stdout and stderr to logfile as the process continues.
 
         Parameters
         ----------
@@ -299,30 +412,38 @@ class RunCmd(threading.Thread):
             Time in minutes after which process will be killed. Pass 0 to
             let process run indefinitely.
 
+        logfile : A writable file object
+            A file to which calculation stdout and stderr will be written
+
         cwd : string, default .
             Directory in which process will be run
         """
         threading.Thread.__init__(self)
         self.cmd = cmd
+        self.logfile = logfile
+        self.cwd = cwd
         if timeout == 0:
             self.timeout = None
         else:
             self.timeout = timeout*60 #convert to seconds
-        self.cwd = cwd
 
     def run(self):
         self.p = subprocess.Popen(self.cmd, preexec_fn=os.setsid,
                            stdout=subprocess.PIPE,
+                           stderr=subprocess.STDOUT,
                            cwd=self.cwd)
-        self.p.wait()
+        lines_iterator = iter(self.p.stdout.readline, "") #terminates when readline returns ""
+        for line in lines_iterator:
+            self.logfile.write(line)
+            self.logfile.flush()
 
     def run_and_timeout(self):
         """Run subprocess
 
         Returns
         -------
-        out : tuple
-            stout and stderr outputs
+        out : int
+            Exit code of subprocess
         """
         self.start()
         self.join(self.timeout)
@@ -335,7 +456,272 @@ class RunCmd(threading.Thread):
             print('Has run out of time')
             print('!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!!')
             raise RuntimeError("3D-RISM calc didn't finish in time.")
-        return self.p.communicate()
+
+
+def prepare_calc_directory(mol_path, T, dir_name=None):
+    """Copy pdb file into the directory with the same name. If such directory
+    doesn't exist it will try to create it.
+
+    Parameters
+    ----------
+    mol_path : string
+        Path to solute
+
+    T : float
+        A calculation temperature
+
+    dir_name : string or None
+        A name of directory in which calculation is produced. If None is
+        supplied a default value will be used.
+
+    Returns
+    -------
+    name: string
+        Full path to pdb file without extension
+    dir_name: string
+        Name of the calculation directory
+    """
+    pdb_path, name_without_path = os.path.split(mol_path)
+    if not dir_name:
+        dir_name = os.path.join(pdb_path, name_without_path[:-4] + '_' + str(T))
+    try:
+        os.mkdir(dir_name)
+    except OSError, e:
+        if e.errno == 17:
+            pass
+        else:
+            raise e
+    name = os.path.join(dir_name, name_without_path)
+    shutil.copy(mol_path, name)
+    return name[:-4], dir_name
+
+
+def prepare_logfile(name):
+    """Create a logfile which will be used throught calculation.
+
+    Parameters
+    ----------
+    name : string
+        Full path to pdb file without extension
+
+    Returns
+    -------
+    out: file object
+        Returns logfile.
+    """
+    p, _ = os.path.split(name)
+    if p == '':
+        p = '.'
+    log_name = '{}.log'.format(name)
+    logfile = open(log_name, 'w')
+    logfile.write(str(datetime.datetime.now()))     # timestamp
+    logfile.flush()
+    return logfile
+
+
+def generate_prmtop(name, logfile, molcharge=0, multiplicity=1,
+                   charge_f=None):
+    """Generate topology file using GAFF charges scaled by the supplied
+    factor.
+
+    Parameters
+    ----------
+    name : string
+        Full path to pdb file without extension
+
+    logfile : A writable file object
+        A file to which calculation std. output will be written
+
+    molcharge : int
+        Charge of the solute
+
+    multiplicity : int
+        Multiplicty of the solute
+
+    charge_f : string
+        A name of the file containing atomic partial charges readable by
+        antechamber. The file will be supplied to the antechamber through
+        the option rc. It should contain partial charges appearing in the
+        same order as in the pdb file with not more than 8 charges per row.
+
+    Returns
+    -------
+    out: string
+        Returns the name of prepared topology file
+    """
+    p, no_p_name = os.path.split(name)
+    if p == '':
+        p = '.'
+    #Firstly we use antechamber to recognize atom and bonding types, and
+    #generate topology
+    if charge_f:
+        charge_f = os.path.relpath(charge_f, p) #path relative to calc dir
+        ante_out = subprocess.check_output(['antechamber',
+                         '-i', '{}.pdb'.format(no_p_name),
+                         '-fi', 'pdb',
+                         '-o', '{}.prepin'.format(no_p_name), #output file
+                         '-fo', 'prepi',   #output format describing each residue
+                         '-c', 'rc',      #charge method: read in charge
+                         '-cf', charge_f, #file with charges
+                         '-s', '2',    #status info ; 2 means verbose
+                         ],
+                         cwd=p)
+    else:
+        ante_out = subprocess.check_output(['antechamber',
+                         '-i', '{}.pdb'.format(no_p_name),
+                         '-fi', 'pdb',
+                         '-o', '{}.prepin'.format(no_p_name), #output file
+                         '-fo', 'prepi',   #output format describing each residue
+                         '-c', 'bcc',      #charge method  (AM1-BCC)
+                         '-s', '2',    #status info ; 2 means verbose
+                         '-nc', str(molcharge),   #Net molecule charge
+                         '-m', str(multiplicity)   #Multiplicity
+                         ],
+                         cwd=p)
+    logfile.write(ante_out)
+    #Run parmchk to generate missing gaff force field parameters
+    parm_out = subprocess.check_output(['parmchk2',
+                     '-i', '{}.prepin'.format(no_p_name),
+                     '-f', 'prepi',
+                     '-o', '{}.frcmod'.format(no_p_name)], #file with missing FF params
+                     cwd=p)
+    logfile.write(parm_out)
+    logfile.flush()
+    #Run tleap to generate topology and coordinates for the molecule
+    leap_input_name = os.path.join(p, 'runleap.in')
+    with open(leap_input_name, 'w') as f:
+        f.write(RUNLEAP.format(name=no_p_name))
+    leap_out = subprocess.check_output(['tleap', '-f', 'runleap.in'], cwd=p)
+    logfile.write(leap_out)
+    logfile.flush()
+    prmtop_name = '{}.prmtop'.format(no_p_name)
+    return prmtop_name
+
+
+def prepare_prmtop(args, name, dir_name, logfile):
+    """ Places appropriate prmtop file into the calculation folder and scales
+    it's charges if necessary.
+
+    Parameters
+    ----------
+
+    args : Namespace
+        Command line arguments
+
+    name : string
+        Calculation name
+
+    dir_name : string
+        Name of calculation directory
+
+    logfile : File_object
+        Calculation log
+
+    Returns
+    -------
+
+    out : string
+        Path to prmtop file.
+
+    """
+    # Copy prmtop file, because we might want to change it (change charges)
+    if not args.prmtop:
+        print('Running AM1-BCC calculation...')
+        prmtop_name = generate_prmtop(name, logfile, args.molcharge, args.multiplicity,
+                                     args.charge_f)
+    else:
+        print('Reading user provided prmtop file')
+        try:
+            shutil.copy(args.prmtop, dir_name)
+            prmtop_name = args.prmtop  # names are relative to calc directory
+        except shutil.Error:
+            # most likely error is due to src = destination
+            prmtop_name = os.path.split(args.prmtop)[1]
+    #Open file and scale all the charges
+    prm_lines = []
+    with open(os.path.join(dir_name, prmtop_name), 'r') as f:
+        for line in f:
+            if line.startswith('%FLAG CHARGE'):
+                prm_lines.append(line)
+                prm_lines.append(next(f)) # skip format line
+                next_line = next(f)
+                while next_line.startswith(' '):
+                    chrgs = next_line.split()
+                    new_chrgs = ['{: .8E}'.format(float(chg)*args.scale_chg) for chg in chrgs]
+                    prm_lines.append( ' ' + ' '.join(new_chrgs) + '\n')
+                    next_line = next(f)
+            else:
+                prm_lines.append(line)
+    with open(os.path.join(dir_name, prmtop_name), 'w') as f:
+        f.writelines(prm_lines)
+    return prmtop_name
+
+
+def run_rism1d(name, logfile, T=298.15, smodel="SPC", rism1d="DRISM",
+                        closure="HNC", xvv=None):
+    """Generate topology and xvv file at given temperature. Parse and get
+    water compressibility from water thermodynamic output. Return data needed
+    for subsequent calculations.
+
+    Parameters
+    ----------
+    name : string
+        Full path to pdb file without extension
+
+    T : float, default 298.15
+        A calculation temperature
+
+    smodel : string, default SPC
+        Water model available in $AMBERHOME/dat/rism1d/model/{smodel}.mdl
+
+    rism1d : string, default DRISM
+        Type of 1D-RISM theory. Only DRISM has been extensively tested
+
+    closure : string, default HNC
+        Brdige closure which will be used in both 1D-RISM simmulation
+
+    xvv: string
+        Name of an existing xvv file. If supplied, 1D-RISM calulation will
+        be skipped
+
+    therm: string
+        Name of an existing therm file. If supplied, 1D-RISM calcualtion will
+        be skipped and compressability will be taken from this file.
+
+    Returns
+    -------
+    out: tuple
+        Returns (xvv, rism1d_name).
+        xvv is the path to solvent susceptibility file relative to calculation
+        directory (p).
+        rism1d_name is the base name for all 1d-rism calculation output.
+        If no calculation took place returns None.
+    """
+    p, _ = os.path.split(name)
+    rism1d_name = None
+    if p == '':
+        p = '.'
+    if not xvv:
+        #Generate solvent susceptibility file
+        rism1d_name = RISM1D_NAME.format(smodel=smodel, temp=T)
+        xvv_script_name_no_p = '{}.sh'.format(rism1d_name)
+        xvv_script_name = os.path.join(p, xvv_script_name_no_p)
+        diel = round(water_dielectric_const(T), 3)
+        conc = round(water_concentration(T), 3)
+        succ_srcirpt = SOLV_SUCEPT_SCRPT.format(temp=T, diel=diel, conc=conc,
+                                                smodel=smodel, rism1d=rism1d,
+                                                closure=closure,
+                                                name1d=rism1d_name)
+        with open(xvv_script_name, 'w') as f:
+            f.write(succ_srcirpt)
+        xvv_out = subprocess.check_output(['bash', xvv_script_name_no_p],
+                                          cwd=p)
+        logfile.write(xvv_out)
+        logfile.flush()
+        xvv = '{}.xvv'.format(rism1d_name)
+    else:
+        xvv = os.path.relpath(xvv, p) # path relative to the calc. directory
+    return xvv, rism1d_name
 
 
 class RISM3D_Singlpnt(object):
@@ -347,7 +733,7 @@ class RISM3D_Singlpnt(object):
     The calculation details like closure or tolerance are defined in
     setup_calculation method.
     """
-    def __init__(self, name, T, logfile, prmtop_name=None, xvv_name=None):
+    def __init__(self, name, T, logfile, prmtop_name=None, xvv=None):
         """ Create a class for running rism3d.snglpnt.
 
         Parameters
@@ -363,12 +749,14 @@ class RISM3D_Singlpnt(object):
 
         prmtop_name : string, default None
             A name of topology file for calculation without extension. If
-            it is not specified defaults to name.prmtop
+            it is not specified defaults to name.prmtop. Path should be given
+            relative to the directory in which pdb file is located.
 
-        xvv_name : string, default None
+        xvv : string, default None
             A name of susceptibility file for this calculation. Defaults
             to water_T.xvv, where T is calculation temperature rounded to
-            two digits.
+            two digits. Path should be given relative to the directory in
+            which pdb file is located.
 
         """
         self.name = name
@@ -379,17 +767,21 @@ class RISM3D_Singlpnt(object):
             self.prmtop_name = prmtop_name
         else:
             self.prmtop_name = '{}.prmtop'.format(self.no_p_name)
-        if xvv_name:
-            self.xvv_name = xvv_name
+        if xvv:
+            self.xvv_name = xvv
         else:
             self.xvv_name = 'water_{temp}.xvv'.format(temp=self.T)
         self.run_flags_list = None
 
-    def setup_calclation(self, closure='hnc', write_h=True,
-                         write_c=True,
-                         write_u=False, buffer_distance=30.0,
-                         grdspc=(0.3, 0.3, 0.3),
-                         tollerance=1e-10, polar_decomp=False):
+    def setup_calculation(self, closure='hnc', write_g=False, write_h=False,
+                          write_c=False,
+                          write_u=False, write_asymp=False,
+                          noasympcorr=False,
+                          buffer_distance=25.0,
+                          solvbox=False,
+                          grdspc=(0.5, 0.5, 0.5),
+                          tolerance=1e-5, polar_decomp=False,
+                          verbose=0, maxstep=500):
         """ Setup calculation rism3d.snglpnt. calculation.
 
         More details on each of the parameter can be found in AmberTools
@@ -401,9 +793,13 @@ class RISM3D_Singlpnt(object):
             Allowed closure values are kh, hnc, pseN. Here N is an
             integer.
 
+        write_g : boolean, default True
+            Specifies whether program will write radial distribution
+            functions.
+
         write_h : boolean, default True
             Specifies whether program will write total correlation
-            functions.
+            functions in k space.
 
         write_c : boolean, default True
             Specifies wheter program will write direct correlation
@@ -412,33 +808,54 @@ class RISM3D_Singlpnt(object):
         write_u : boolean, default False
             Specifies wheter program will write potential energy
             grid.
+            
+        write_asymp : boolean, default False
+            Write asymptotics of total and direct correlation fuctions in 
+            real space.         
+            
+        noasympcorr : boolean, default False
+            Don't use long range corrections to compute thermodynamics.
 
-        buffer_distance : float, default 30.0
+        buffer_distance : float, default 25.0
             Minimum distance between the solute and the edge of
             the solvent box in A.
 
-        grdsp: array-like (should contain 3 floats), default (0.3, 0.3, 0.3)
+        solvbox : array-like (should contain 3 floats)
+            Size of the box in x y and z directions. Overrides buffer_distance.
+
+        grdsp: array-like (should contain 3 floats), default (0.5, 0.5, 0.5)
             Comma separated linear grid spacings for x, y and z dimensions.
 
-        tollerance: float, default 1e-10
+        tolerance: float, default 1e-10
             Maximum residual values for solution convergence.
 
         polar_decomp: boolean, default False
             Decomposes solvation free energy into polar and non-polar
             components
+
+        verbose: int, default 0
+            Either 0, 1 or 2. Determines verbosity of caluclation.
+
+        maxstep: int, default 1000
+            Number of iterations in 3D-RISM calculation.
         """
-        if len(grdspc) == 3:
-            grdspc = ','.join(map(str, grdspc))
-        tollerance = str(tollerance)
+        grdspc = ','.join(map(str, grdspc))
+        if solvbox:
+            solvbox = ','.join(map(str, solvbox))
         self.run_flags_list = ['rism3d.snglpnt',
              '--pdb', '{}.pdb'.format(self.no_p_name),
              '--prmtop', self.prmtop_name,
-             '--closure', closure,
              '--xvv', self.xvv_name,
-             '--buffer', '{:.6f}'.format(buffer_distance), #distance between solute
-                                                      #and the edge of solvent box
-             '--grdspc', grdspc,
-             '--tolerance', tollerance]
+             '--grdspc', grdspc,]
+        self.run_flags_list.extend(['--tolerance'] + tolerance)
+        self.run_flags_list.extend(['--closure'] + closure)
+        if solvbox:
+            self.run_flags_list.extend(['--solvbox', solvbox])
+        else:
+            self.run_flags_list.extend(['--buffer', str(buffer_distance)])
+        if write_g:
+            self.run_flags_list.extend(['--guv',
+                                         'g_{}'.format(self.no_p_name)])
         if write_h:
             self.run_flags_list.extend(['--huv',
                                          'h_{}'.format(self.no_p_name)])
@@ -448,8 +865,19 @@ class RISM3D_Singlpnt(object):
         if write_u:
             self.run_flags_list.extend(['--uuv',
                                          'u_{}'.format(self.no_p_name)])
+        if write_asymp:
+            self.run_flags_list.extend(['--asymp',
+                                         'a_{}'.format(self.no_p_name)])
+        if noasympcorr:
+            self.run_flags_list.extend(['--noasympcorr'])
         if polar_decomp:
             self.run_flags_list.extend(['--polarDecomp'])
+        if verbose:
+            self.run_flags_list.extend(['--verbose'])
+            self.run_flags_list.extend(['{}'.format(verbose)])
+        if maxstep:
+            self.run_flags_list.extend(['--maxstep'])
+            self.run_flags_list.extend(['{}'.format(maxstep)])
 
     def run_calculation_and_log(self, timeout=30):
         """Run 3D-RISM single point calculation and log.
@@ -466,138 +894,20 @@ class RISM3D_Singlpnt(object):
         """
         start_time = time.time()
         if IS_UNIX:  # use timeout
-            run3drism = RunCmd(self.run_flags_list, timeout, cwd=self.p)
-            rism_out = run3drism.run_and_timeout()[0]
+            run3drism = RunCmd(self.run_flags_list, timeout,
+                               self.logfile, cwd=self.p)
+            run3drism.run_and_timeout()
         else:    # windows
             rism_out = subprocess.check_output(self.run_flags_list, cwd=self.p)
-        self.logfile.write(rism_out)
+            self.logfile.write(rism_out)
         self.logfile.flush()
         #write timestamp and close
         end_time = time.time()
         self.logfile.write(str(datetime.datetime.now()) + '\n')
         runtime = end_time - start_time
-        self.logfile.write(str(round(runtime)))
+        self.logfile.write('3D-RISM runtime: {:.0f}'.format(runtime))
         self.logfile.flush()
         self.logfile.close()
-
-
-def prepare_3drism_calc(name, T=298.15, wmodel="SPC", rism1d="DRISM",
-                        closure="HNC"):
-    """Generate topology and xvv file at given temperature. Parse and get
-    water compressibility from water thermodynamic output. Return data needed
-    for subsequent calculations.
-
-    Parameters
-    ----------
-    name : string
-        Full path to pdb file without extension
-
-    T : float, default 298.15
-        A calculation temperature
-
-    wmodel : string, default SPC
-        Water model available in $AMBERHOME/dat/rism1d/model/{wmodel}.mdl
-
-    rism1d : string, default DRISM
-        Type of 1D-RISM theory. Only DRISM has been extensively tested
-
-    closure : string, default HNC
-        Brdige closure which will be used in both 1D-RISM simmulation
-
-    Returns
-    -------
-    out: tuple
-        Returns (logfile, prmtop_name, compres).
-        logfile is a writable file object containing std. out. prmtop_name
-        is the name of prepared topology file. compres is the float value of
-        water compressibility [10e-4/MPa]
-    """
-    p, no_p_name = os.path.split(name)
-    log_name = '{}.log'.format(name)
-    logfile = open(log_name, 'wb')
-    logfile.write(str(datetime.datetime.now()))     # timestamp
-    #Firstly we use antechamber to recognize atom and bonding types, and
-    #generate topology
-    ante_out = subprocess.check_output(['antechamber',
-                     '-i', '{}.pdb'.format(no_p_name),
-                     '-fi', 'pdb',
-                     '-o', '{}.prepin'.format(no_p_name), #output file
-                     '-fo', 'prepi',   #output format describing each residue
-                     '-c', 'bcc',      #charge method  (AM1-BCC)
-                     '-s', '2',    #status info ; 2 means verbose
-                     '-nc', '0',   #Net molecule charge
-                     '-m', '1'],   #Multiplicity
-                     cwd=p)
-    logfile.write(ante_out)
-    #Run parmchk to generate missing gaff force field parameters
-    parm_out = subprocess.check_output(['parmchk',
-                     '-i', '{}.prepin'.format(no_p_name),
-                     '-f', 'prepi',
-                     '-o', '{}.frcmod'.format(no_p_name)], #file with missing FF params
-                     cwd=p)
-    logfile.write(parm_out)
-    logfile.flush()
-    #Run tleap to generate topology and coordinates for the molecule
-    leap_input_name = os.path.join(p, 'runleap.in')
-    with open(leap_input_name, 'wb') as f:
-        f.write(RUNLEAP.format(name=no_p_name))
-    leap_out = subprocess.check_output(['tleap', '-f', 'runleap.in'], cwd=p)
-    logfile.write(leap_out)
-    logfile.flush()
-    #Generate water susceptibility file
-    xvv_script_name_no_p = 'water_{}_script.sh'.format(T)
-    xvv_script_name = os.path.join(p, xvv_script_name_no_p)
-    diel = round(water_dielectric_const(T), 3)
-    conc = round(water_concentration(T), 3)
-    succ_srcirpt = SOLV_SUCEPT_SCRPT.format(temp=T, diel=diel, conc=conc,
-                                            wmodel=wmodel, rism1d=rism1d,
-                                            closure=closure)
-    with open(xvv_script_name, 'wb') as f:
-        f.write(succ_srcirpt)
-    xvv_out = subprocess.check_output(['bash', xvv_script_name_no_p], cwd=p)
-    logfile.write(xvv_out)
-    logfile.flush()
-    #Get compressibility from 1D-RISM therm. output
-    water_therm_name = 'water_{}.therm'.format(T)
-    water_therm_p = os.path.join(p, water_therm_name)
-    with open(water_therm_p, 'rb') as f:
-        w_lines = f.readlines()
-    compres = float(w_lines[2].split()[-1])
-    units = w_lines[2].split()[-2]
-    if units == '[1/kPa]':  # # !! In ambertools 14 compressiblity has [1/kpa] units!
-        compres = compres*1.0e4
-    prmtop_name = '{}.prmtop'.format(no_p_name)
-    return logfile, prmtop_name, compres
-
-
-def prepare_calc_directory(mol_path, T):
-    """Copy pdb file into the directory with the same name. If such directory
-    doesn't exist it will try to create it.
-
-    Parameters
-    ----------
-    mol_path: string
-        Path to solute
-    T: float
-        A calculation temperature
-
-    Returns
-    -------
-    name: string
-        Full path to pdb file without extension
-    """
-    pdb_path, name_without_path = os.path.split(mol_path)
-    dir_name = os.path.join(pdb_path, name_without_path[:-4] + '_' + str(T))
-    try:
-        os.mkdir(dir_name)
-    except OSError, e:
-        if e.errno == 17:
-            pass
-        else:
-            raise e
-    name = os.path.join(dir_name, name_without_path)
-    shutil.copy(mol_path, name)
-    return name[:-4]
 
 
 def clean_up(name, T, level):
@@ -612,7 +922,7 @@ def clean_up(name, T, level):
         A calculation temperature
 
     level : {0, 1, 2}
-        0 - delete nothing; 
+        0 - delete nothing;
         1 - delete ANTECHAMBER*, all water but .sh and .therm,
         .frcmod, .prepin, NEWPDB.PDB, PREP.INF, ATOMTYPE.INF, runleap.in
         sqm*, leap.log;
@@ -638,48 +948,78 @@ def clean_up(name, T, level):
         all_files.remove(log_name)
         will_be_deleted_list.extend([os.path.join(p, f) for f in all_files])
     for f in will_be_deleted_list:
-        os.unlink(f)
+        try:
+            os.unlink(f)
+        except OSError, e:
+            if e.errno == 2:
+                pass
+            else:
+                raise e
 
 
-def write_results(name, T, compres):
+def write_results(name, args, rism1d_name=None):
     """ Parses log file and writes free energies and corrections to
     results.txt.
 
     Parameters
     ----------
-    name: string
+    name : string
         Full path to pdb file without extension
 
-    T: float
-        A calculation temperature
+    args : float
+        Command line arguments.
 
-    compres: float
-        Water compressibility obtained from 1D-RISM output [10e-4/MPa]
-        (note that experimental compressibility is meaningless; here we are
-        using HNC compressibility to correct gigantic pressure which water has
-        according to 1D-RISM calculation).
+    rism1d_name : string
+        Name of 1d-rism calculation
     """
+    T = args.temperature
     p, _ = os.path.split(name)
     log_name = '{}.log'.format(name)
-    with open(log_name, 'rb') as f:
+    exchem = None
+    pmv = None
+    with open(log_name, 'r') as f:
         for line in f:
             if line[0:11] == "rism_exchem":
-                hnc = float(line.split()[1])
+                exchem = float(line.split()[1])
             if line[0:11] == "rism_exchGF":
                 gf = float(line.split()[1])
             if line[0:11] == "rism_volume":
                 pmv = float(line.split()[1])
-    density = water_concentration(T)*6.0221413E-4 #number density 1/A3
-    rho_c_k0 = 1 - 1e-20/(density*1.3806488E-23*T*compres) #density*c(k=0)
-    cor = 1.9872041E-3*T/2*rho_c_k0*density*pmv
-    fix_cor = -density*1.9872041E-3*T*pmv
-    isc = hnc + cor + fix_cor # initial state correction [kcal/mol]
-    isc_star = hnc + cor # partial molar volume correction [kcal/mol]
+    if not pmv:
+        raise ValueError("Cannot find pmv value in log file. Most likely calculation didn't converge.")
 
-    results = RESULTS.format(hnc=hnc, gf=gf, pmv=pmv, isc=isc, isc_star=isc_star)
-    #Write results
-    with open(os.path.join(p, RESULTS_NAME), 'wb') as f:
+    # Check if we can do ISc
+    if args.therm:
+        therm_p = args.therm
+    elif rism1d_name:
+        therm_name = '{}.therm'.format(rism1d_name)
+        therm_p = os.path.join(p, therm_name)
+    else:
+        therm_p = None
+    if therm_p:  # Calculating ISc correction
+        compres = get_compressibility_from_therm(therm_p)
+        if args.xvv:
+            density = get_density_from_xvv(args.xvv)
+        else:
+            density = water_concentration(T)*6.0221413E-4 #number density 1/A3
+        rho_c_k0 = 1 - 1e-20/(density*1.3806488E-23*T*compres) #density*c(k=0)
+        cor = 1.9872041E-3*T/2*rho_c_k0*density*pmv
+        fix_cor = -density*1.9872041E-3*T*pmv
+        isc = exchem + cor + fix_cor # initial state correction [kcal/mol]
+        isc_star = exchem + cor # partial molar volume correction [kcal/mol]
+    else:
+        isc = None
+        isc_star = None
+    #Write and print results
+    results = RESULTS.format(exchem=exchem, gf=gf, pmv=pmv, isc=isc, isc_star=isc_star)
+    with open(os.path.join(p, RESULTS_NAME), 'w') as f:
         f.write(results)
+    print('Calculation has finished')
+    print('RISM exchem={} kcal/mol'.format(exchem))
+    if isc:
+        print('ISc dG*(hyd)={} kcal/mol'.format(isc))
+    print('Detailed output can be found in {} and in {}.log'\
+                                        .format(RESULTS_NAME, name))
     return isc
 
 
@@ -692,31 +1032,35 @@ def main(argv):
         raise ValueError("Temperature is outside of allowed range.")
     print('Starting HFE calculation for {} at T={} K'.format(args.file,
                                                             args.temperature))
-    name = prepare_calc_directory(args.file, args.temperature)
-    print('Running AM1-BCC and 1D-RISM calculations...')
-    logfile, prmtop_name, compres = prepare_3drism_calc(name,
-                            args.temperature, args.wmodel, args.rism1d,
-                            args.closure)
+    name, dir_name = prepare_calc_directory(args.file, args.temperature, args.dir_name)
+    logfile = prepare_logfile(name)
+    prmtop_name = prepare_prmtop(args, name, dir_name, logfile)
+    print('Running 1D-RISM calculation...')
+    xvv, rism1d_name = run_rism1d(name, logfile, args.temperature, args.smodel,
+                                  args.rism1d, args.closure[-1], xvv=args.xvv)
     rism_calc = RISM3D_Singlpnt(name, args.temperature,
-                                logfile, prmtop_name=prmtop_name)
-    rism_calc.setup_calclation(args.closure, args.write_h, args.write_c,
-                               buffer_distance=args.buffer_distance,
-                               grdspc=args.grdsp,
-                               tollerance=args.tollerance,
-                               polar_decomp=args.polar_decomp)
+                                logfile, prmtop_name=prmtop_name,
+                                xvv=xvv)
+    rism_calc.setup_calculation(args.closure, 
+                                write_g=args.write_g, 
+                                write_c=args.write_c,
+                                write_u=args.write_u,
+                                write_asymp=args.write_asymp,
+                                noasympcorr=args.noasympcorr,
+                                buffer_distance=args.buffer,
+                                solvbox=args.solvbox,
+                                grdspc=args.grdsp,
+                                tolerance=args.tolerance,
+                                polar_decomp=args.polar_decomp,
+                                verbose=args.verbose3d,
+                                maxstep=args.maxstep3d)
     print('Running 3D-RISM calculation...')
     rism_calc.run_calculation_and_log(args.timeout)
-    isc = write_results(name, args.temperature, compres)
-    print('Calculation has finished')
-    print('ISc dG*(hyd)={} kcal/mol'.format(isc))
-    print('Detailed output can be found in {} and in {}.log'\
-                                        .format(RESULTS_NAME, name))
+    write_results(name, args, rism1d_name)
     clean_up(name, args.temperature, args.clean_up)
-
 
 
 if __name__ == '__main__':
     main(sys.argv[1:])
-
-
+    
 
