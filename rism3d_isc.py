@@ -62,10 +62,10 @@ import signal
 
 
 ## Non RISM globals ##
-__version__ = '2015.2'
+__version__ = '2015.3'
 
 REQUIRED_EXECUTABLES = ['antechamber', 'parmchk', 'tleap', 'rism3d.snglpnt',
-                        'rism1d']
+                        'rism1d', 'sander', 'ambpdb']
 
 IS_UNIX = os.name == 'posix'
 
@@ -95,14 +95,37 @@ rism1d {name1d} > {name1d}.out || goto error
 """
 
 RUNLEAP = """source leaprc.gaff
-loadamberprep {name}.prepin
+loadamberprep "{name}.prepin"
 check MOL
-loadamberparams {name}.frcmod
-SaveAmberParm MOL {name}.prmtop {name}.incrd
-SavePdb MOL {name}.pdb
+loadamberparams "{name}.frcmod"
+SaveAmberParm MOL "{name}.prmtop" "{name}.incrd"
+SavePdb MOL "{name}.pdb"
 quit
 """
 
+MIN_SCRIPT = """Normal minimization
+   &cntrl
+        imin=1,      ! perform minimization
+        maxcyc=200,  ! The maximum number of cycles of minimization
+        drms=1e-3,   ! RMS force
+        ntmin=3,     ! xmin algorithm
+        ntb=0,       ! no periodic boundary
+        cut=999.,    ! non-bonded cutoff
+        ntpr=5       ! printing frequency
+   /
+"""
+MIN_SCRIPT_RISM = """Minimization with rism
+   &cntrl
+	imin=1, maxcyc=200, drms=1e-3, ntmin=3,ntb=0,cut=999.,
+	ntpr=5, irism=1
+   /
+   &rism
+	closure='{closure}', buffer=25, tolerance=1e-4,solvcut=9999
+   /
+"""
+
+
+MIN_SCRIPT_NAME = 'min.input'
 RISM1D_NAME = '{smodel}_{temp}'
 RESULTS_NAME = 'results.txt'
 
@@ -147,6 +170,12 @@ def process_command_line(argv):
     parser.add_argument('-t', '--temperature',
                         help="""Temperature in K at which simulation will be
                         run [298.15]""", default=298.15, type=float)
+    parser.add_argument('--minimize',
+                        help=""" Minimize solute before performing
+                        3D-RISM calculation using either gradient descent (min) or
+                        RISM minimization using sander (rism). If no keywords
+                        are provided minimization is not performed.
+                        """)
     parser.add_argument('--clean_up',
                         help=""" How should auxiliary files be treated:
                         0 - delete nothing;
@@ -155,9 +184,9 @@ def process_command_line(argv):
                         """, default=1, type=int)
     parser.add_argument('--timeout',
                         help=""" Minutes after which 3D-RISM calculation
-                        will be killed. Use 0 for no timeout. [30]. Only works
+                        will be killed. Use 0 for no timeout. [0]. Only works
                         on Unix-like system.
-                        """, default=30, type=float)
+                        """, default=0, type=float)
     parser.add_argument('--write_g',
                         help="""Write radial distribution functions produced
                         in 3D-RISM calculation""",
@@ -240,6 +269,10 @@ def process_command_line(argv):
     parser.add_argument('--therm',
                         help="""Output of a 1D-RISM calculation. Note that
                         the temperature option will be ignored.""")
+    parser.add_argument('--density',
+                        help=""" Manually input number density of solvent if it
+                        composed of multiple different species (H20 - NaCl solution).""",
+                        type=float)
     parser.add_argument('-p', '--prmtop',
                         help="""Submit existing prmtop file.""")
     parser.add_argument('--dir_name',
@@ -381,18 +414,26 @@ def get_compressibility_from_therm(therm_p):
     Returns
     -------
     compres : float
-        Units: 10e-4/MPa
+        Units: 1/MPa
     """
     with open(therm_p, 'r') as f:
         therm_lines = f.readlines()
     compres = float(therm_lines[2].split()[-1])
     units = therm_lines[2].split()[-2]
-    # # !! In ambertools 14 compressiblity is bugged.
-    # Units are shown to be [1/kpa], while in reality compres is 1.0e4 smaller
-    # http://archive.ambermd.org/201503/0651.html
+    if units == '[10e-4/MPa]':
+        # Old version of Ambertools
+        return compres*10e-4
     if units == '[1/kPa]':
-        compres = compres*1.0e4
-    return compres
+        # # !! This is ambertools 14, where compressiblity is bugged.
+        # Units are shown to be [1/kPa], while in reality compres thea are in [1/MPa]
+        # http://archive.ambermd.org/201503/0651.html
+        return compres
+    if units == '[1/MPa]':
+        # This is ambertools 15
+        # All is good
+        return compres
+    else:
+        raise ValueError('Unknown compressiblity format, check *.therm file')
 
 
 
@@ -496,13 +537,16 @@ def prepare_calc_directory(mol_path, T, dir_name=None):
     return name[:-4], dir_name
 
 
-def prepare_logfile(name):
+def prepare_logfile(name, argv):
     """Create a logfile which will be used throught calculation.
 
     Parameters
     ----------
     name : string
         Full path to pdb file without extension
+    
+    argv : list
+        Command used to start script
 
     Returns
     -------
@@ -514,7 +558,8 @@ def prepare_logfile(name):
         p = '.'
     log_name = '{}.log'.format(name)
     logfile = open(log_name, 'w')
-    logfile.write(str(datetime.datetime.now()))     # timestamp
+    logfile.write(str(datetime.datetime.now())+'\n')     # timestamp
+    logfile.write(' '.join(argv) + '\n')
     logfile.flush()
     return logfile
 
@@ -598,6 +643,49 @@ def generate_prmtop(name, logfile, molcharge=0, multiplicity=1,
     return prmtop_name
 
 
+def check_consistency(prmtop_name, name):
+    """ Check if the ordering of atoms is the same both in pdb file and in
+    prmtop file.
+    
+    Parameters
+    ----------
+    
+    prmtop_name : string
+        Path to prmtop file
+    
+    name : string
+        Calculation name
+    """
+    p, no_p_name = os.path.split(name)
+    if p == '':
+        p = '.'
+    pdb_atom_list = []
+    with open(name + '.pdb') as f:
+        for line in f:
+            if line.startswith('ATOM'):
+                pdb_atom_list.append(line[12:16])  # atom name field
+    with open(os.path.join(p, prmtop_name)) as f:
+        prmtop_atom_string = ''
+        n=4 # number of columns for each atname in prmtop
+        lastcol=80 # last column in each prmtop line
+        for line in f:
+            if line.startswith('%FLAG ATOM_NAME'):
+                f.next() # skip one line
+                atom_name_row = next(f)
+                while not atom_name_row.startswith('%'):
+                    prmtop_atom_string += atom_name_row[:lastcol+1]
+                    atom_name_row = next(f)
+        # split string into characters of length n
+        prmtop_atom_list = [prmtop_atom_string[i:i+n] \
+                                for i in range(0, len(prmtop_atom_string), n)]
+    for i, (pdb_aname, prmtop_aname) in \
+                             enumerate(zip(pdb_atom_list, prmtop_atom_list)):
+        if pdb_aname.strip() != prmtop_aname.strip():
+            raise ValueError("The name of atom number {} in pdb file is: {} and \
+in prmtop file: {}. Check the consistency between two files.".format(i,
+                        pdb_aname.strip(), prmtop_aname.strip()))
+
+
 def prepare_prmtop(args, name, dir_name, logfile):
     """ Places appropriate prmtop file into the calculation folder and scales
     it's charges if necessary.
@@ -633,10 +721,11 @@ def prepare_prmtop(args, name, dir_name, logfile):
         print('Reading user provided prmtop file')
         try:
             shutil.copy(args.prmtop, dir_name)
-            prmtop_name = args.prmtop  # names are relative to calc directory
+            prmtop_name = os.path.split(args.prmtop)[1]  # names are relative to calc directory
         except shutil.Error:
             # most likely error is due to src = destination
             prmtop_name = os.path.split(args.prmtop)[1]
+        check_consistency(prmtop_name, name)
     #Open file and scale all the charges
     prm_lines = []
     with open(os.path.join(dir_name, prmtop_name), 'r') as f:
@@ -650,11 +739,82 @@ def prepare_prmtop(args, name, dir_name, logfile):
                     new_chrgs = ['{: .8E}'.format(float(chg)*args.scale_chg) for chg in chrgs]
                     prm_lines.append( ' ' + ' '.join(new_chrgs) + '\n')
                     next_line = next(f)
+                prm_lines.append(next_line)
             else:
                 prm_lines.append(line)
     with open(os.path.join(dir_name, prmtop_name), 'w') as f:
         f.writelines(prm_lines)
     return prmtop_name
+    
+    
+def minimize_solute(name, logfile, prmtop_name, args, xvv):
+    """ Minimize the solute structure using Sander. 
+    The pdb file in the calculation directory **will** be overwritten.
+    
+    Parameters
+    ----------
+
+    name : string
+        Calculation name
+
+    logfile : File_object
+        Calculation log
+    
+    prmtop_name : string, default None
+        Topology file for calculation. Path should be given
+        relative to the directory in which pdb file is located.
+        
+    args : Namespace
+        Command line arguments
+
+    xvv: string
+        Name of an existing xvv file.
+
+    """
+    p, no_p_name = os.path.split(name)
+    if p == '':
+        p = '.'
+    if args.minimize == 'min':
+        min_script = MIN_SCRIPT
+    elif args.minimize == 'rism':
+        min_script = MIN_SCRIPT_RISM
+    else:
+        raise ValueError('Unknown minimization type. Use either rism or min.')
+    print('Minimizing solute structure')
+    # use or create restart (incrd) file
+    rst_name = os.path.join(name + '.incrd')
+    if not os.path.isfile(rst_name):
+        conv_out = subprocess.check_output(['antechamber',
+                         '-i', '{}.pdb'.format(no_p_name),
+                         '-fi', 'pdb',
+                         '-o', '{}.incrd'.format(no_p_name), #output file
+                         '-fo', 'rst',   #output format
+                         ],
+                         cwd=p)
+        logfile.write(conv_out)
+    with open(os.path.join(p, MIN_SCRIPT_NAME), 'w') as f:
+        f.write(min_script.format(closure=args.closure[-1]))
+    # minimize solute and overwrite restart file
+    min_out = subprocess.check_output(['sander',
+                                       '-O', #overwrite files
+                                       '-i', MIN_SCRIPT_NAME,
+                                       '-p', prmtop_name,
+                                       '-c', '{}.incrd'.format(no_p_name),
+                                       '-r', '{}.incrd'.format(no_p_name),
+                                       '-xvv', os.path.relpath(xvv, p)
+                                       ],
+                                       cwd=p)
+    logfile.write(min_out)
+    with open(rst_name) as f:
+        rst_text = f.read()
+    # converst restart file to pdb and write
+    p = subprocess.Popen(['ambpdb',
+                          '-p', prmtop_name], stdout=subprocess.PIPE,
+                          stderr=subprocess.PIPE, stdin=subprocess.PIPE)
+    pdb_min = p.communicate(input=rst_text)[0]
+    #print(pdb_min)
+    with open(name + '.pdb', 'w') as f:
+        f.write(pdb_min)
 
 
 def run_rism1d(name, logfile, T=298.15, smodel="SPC", rism1d="DRISM",
@@ -703,6 +863,7 @@ def run_rism1d(name, logfile, T=298.15, smodel="SPC", rism1d="DRISM",
         p = '.'
     if not xvv:
         #Generate solvent susceptibility file
+        print('Running 1D-RISM calculation...')
         rism1d_name = RISM1D_NAME.format(smodel=smodel, temp=T)
         xvv_script_name_no_p = '{}.sh'.format(rism1d_name)
         xvv_script_name = os.path.join(p, xvv_script_name_no_p)
@@ -748,7 +909,7 @@ class RISM3D_Singlpnt(object):
             A file to which calculation std. output will be written
 
         prmtop_name : string, default None
-            A name of topology file for calculation without extension. If
+            A name of topology file for calculation. If
             it is not specified defaults to name.prmtop. Path should be given
             relative to the directory in which pdb file is located.
 
@@ -926,7 +1087,7 @@ def clean_up(name, T, level):
         1 - delete ANTECHAMBER*, all water but .sh and .therm,
         .frcmod, .prepin, NEWPDB.PDB, PREP.INF, ATOMTYPE.INF, runleap.in
         sqm*, leap.log;
-        2 - delete ALL but RESULTS_NAME and logfile.
+        2 - delete ALL but RESULTS_NAME and logfile - not recommended.
     """
     p, no_p_name = os.path.split(name)
     water_name = 'water_{}'.format(T)
@@ -934,7 +1095,8 @@ def clean_up(name, T, level):
     to_del1_files = [no_p_name + '.prepin', no_p_name + '.frcmod',
                     water_name + '.inp', water_name + '.out',
                     water_name + '.sav', 'ATOMTYPE.INF',
-                    'leap.log', 'NEWPDB.PDB', 'PREP.INF', 'runleap.in']
+                    'leap.log', 'NEWPDB.PDB', 'PREP.INF', 'runleap.in',
+                    MIN_SCRIPT_NAME, 'mdout', 'mdinfo']
     will_be_deleted_list = []
     if level == 1:
         for wildcard in to_del1_glob:
@@ -997,13 +1159,15 @@ def write_results(name, args, rism1d_name=None):
     else:
         therm_p = None
     if therm_p:  # Calculating ISc correction
-        compres = get_compressibility_from_therm(therm_p)
-        if args.xvv:
+        compres = get_compressibility_from_therm(therm_p)  # units 1/MPa
+        if args.density:
+            density = args.density
+        elif args.xvv:
             density = get_density_from_xvv(args.xvv)
         else:
             density = water_concentration(T)*6.0221413E-4 #number density 1/A3
-        rho_c_k0 = 1 - 1e-20/(density*1.3806488E-23*T*compres) #density*c(k=0)
-        cor = 1.9872041E-3*T/2*rho_c_k0*density*pmv
+        C_k0 = density - 1e-24/(1.3806488E-23*T*compres) #density*c(k=0)
+        cor = 1.9872041E-3*T/2*C_k0*pmv
         fix_cor = -density*1.9872041E-3*T*pmv
         isc = exchem + cor + fix_cor # initial state correction [kcal/mol]
         isc_star = exchem + cor # partial molar volume correction [kcal/mol]
@@ -1033,11 +1197,12 @@ def main(argv):
     print('Starting HFE calculation for {} at T={} K'.format(args.file,
                                                             args.temperature))
     name, dir_name = prepare_calc_directory(args.file, args.temperature, args.dir_name)
-    logfile = prepare_logfile(name)
+    logfile = prepare_logfile(name, argv)
     prmtop_name = prepare_prmtop(args, name, dir_name, logfile)
-    print('Running 1D-RISM calculation...')
     xvv, rism1d_name = run_rism1d(name, logfile, args.temperature, args.smodel,
                                   args.rism1d, args.closure[-1], xvv=args.xvv)
+    if args.minimize:
+        minimize_solute(name, logfile, prmtop_name, args, xvv)
     rism_calc = RISM3D_Singlpnt(name, args.temperature,
                                 logfile, prmtop_name=prmtop_name,
                                 xvv=xvv)
@@ -1056,9 +1221,10 @@ def main(argv):
                                 maxstep=args.maxstep3d)
     print('Running 3D-RISM calculation...')
     rism_calc.run_calculation_and_log(args.timeout)
-    write_results(name, args, rism1d_name)
+    isc = write_results(name, args, rism1d_name)
     clean_up(name, args.temperature, args.clean_up)
-
+    return isc
+    
 
 if __name__ == '__main__':
     main(sys.argv[1:])
